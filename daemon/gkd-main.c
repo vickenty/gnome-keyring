@@ -65,6 +65,8 @@
 #include <glib-object.h>
 #include <glib-unix.h>
 
+#include <libnotify/notify.h>
+
 #include <gcrypt.h>
 
 /* preset file descriptors */
@@ -1007,6 +1009,8 @@ main (int argc, char *argv[])
 	 * Without either of these options, we follow a more boring and
 	 * predictable startup.
 	 */
+
+	notify_init("Gnome Keyring");
 
 	GDBusConnection *connection = NULL;
 	GError *error = NULL;

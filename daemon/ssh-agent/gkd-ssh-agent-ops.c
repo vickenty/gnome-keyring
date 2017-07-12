@@ -25,6 +25,7 @@
 #include "gkd-ssh-agent-private.h"
 
 #include <gck/gck.h>
+#include <libnotify/notify.h>
 
 #include "pkcs11/pkcs11.h"
 #include "pkcs11/pkcs11i.h"
@@ -38,6 +39,8 @@
 #include <stdarg.h>
 #include <string.h>
 #include <stdio.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 
 #define V1_LABEL "SSH1 RSA Key"
 
@@ -982,6 +985,176 @@ unlock_and_sign (GckSession *session, GckObject *key, gulong mech_type, const gu
 	return gck_session_sign (session, key, mech_type, input, n_input, n_result, NULL, err);
 }
 
+static const char *ACTION_ALLOW = "allow";
+static const char *ACTION_DENY = "deny";
+
+typedef struct {
+	GCond cond;
+	GMutex mutex;
+
+	gboolean signalled;
+	gboolean result;
+} ConfirmationResult;
+
+static void
+confirmation_result_init(ConfirmationResult *result)
+{
+	g_cond_init(&result->cond);
+	g_mutex_init(&result->mutex);
+	result->signalled = FALSE;
+}
+
+static void
+confirmation_result_signal(ConfirmationResult *result, gboolean value)
+{
+	g_mutex_lock(&result->mutex);
+	result->result = value;
+	result->signalled = TRUE;
+	g_cond_signal(&result->cond);
+	g_mutex_unlock(&result->mutex);
+}
+
+static gboolean
+confirmation_result_wait(ConfirmationResult *result)
+{
+	gboolean value;
+	g_mutex_lock(&result->mutex);
+	while (!result->signalled) {
+		g_cond_wait(&result->cond, &result->mutex);
+	}
+	value = result->result;
+	g_mutex_unlock(&result->mutex);
+	return value;
+}
+
+static void
+user_confirmation_callback(NotifyNotification *notification, char *action, gpointer user_data)
+{
+	ConfirmationResult *result = (ConfirmationResult*) user_data;
+	confirmation_result_signal(result, g_strcmp0(action, ACTION_ALLOW) == 0);
+}
+
+static gchar *
+get_peer_name(int sock) 
+{
+	struct ucred ucred;
+	int pos;
+	socklen_t ucred_len;
+	gchar *path;
+	GFile *proc;
+	GInputStream *stream;
+	gchar *peer;
+	gssize peer_len;
+	GError *error = NULL;
+
+	if (getsockopt(sock, SOL_SOCKET, SO_PEERCRED, &ucred, &ucred_len) != 0) {
+		return NULL;
+	}
+
+	path = g_markup_printf_escaped("/proc/%d/cmdline", ucred.pid);
+	proc = g_file_new_for_path(path);
+	g_free(path);
+
+	stream = (GInputStream *) g_file_read(proc, NULL, &error);
+	g_object_unref(proc);
+
+	if (error) {
+		g_warning ("error reading command line for pid %d: %s", ucred.pid, egg_error_message (error));
+		g_clear_error (&error);
+		return g_markup_printf_escaped("PID %d", ucred.pid);
+	}
+
+	if (stream == NULL) {
+		return g_markup_printf_escaped("PID %d", ucred.pid);
+	}
+
+	peer = g_malloc(512);
+	peer_len = g_input_stream_read(stream, peer, 512, NULL, &error);
+	if (error) {
+		g_free(peer);
+		g_warning ("error reading command line for pid %d: %s", ucred.pid, egg_error_message (error));
+		g_clear_error (&error);
+		return g_markup_printf_escaped("PID %d", ucred.pid);
+	}
+
+	for (pos = 0; pos < peer_len - 1; pos++) {
+		if (peer[pos] == 0) {
+			peer[pos] = ' ';
+		}
+	}
+
+	peer[peer_len - 1] = 0;
+
+	return peer;
+}
+
+static gboolean
+request_user_confirmation (GkdSshAgentCall *call, GckObject *object)
+{
+	NotifyNotification *notify;
+	GError *error = NULL;
+	GckAttributes *attrs;
+	const GckAttribute *attr;
+	gchar *label = NULL;
+	gchar *text = NULL;
+	gchar *peer = NULL;
+	struct sockaddr_un addr;
+	socklen_t addrlen = sizeof(struct sockaddr_un);
+
+	attrs = gck_object_get (object, NULL, &error, CKA_ID, CKA_LABEL, GCK_INVALID);
+	if (error) {
+		g_warning ("error retrieving attributes for public key: %s", egg_error_message (error));
+		g_clear_error (&error);
+		return TRUE;
+	}
+
+	if (label == NULL) {
+		attr = gck_attributes_find(attrs, CKA_LABEL);
+		if (attr != NULL) {
+			label = gck_attribute_get_string(attr);
+		}
+	}
+
+	if (getpeername(call->sock, (struct sockaddr *) &addr, &addrlen) == 0) {
+		if (addr.sun_family == AF_UNIX) {
+			peer = get_peer_name(call->sock);
+		}
+	}
+
+	ConfirmationResult result;
+	confirmation_result_init(&result);
+
+	text = g_markup_printf_escaped("Allow '%s' to access private key '%s'?", 
+		peer ? peer : "ssh client",
+		label ? label : "unnamed"
+	);
+
+	if (label != NULL) {
+		g_free(label);
+	}
+
+	if (peer != NULL) {
+		g_free(peer);
+	}
+
+	gck_attributes_unref(attrs);
+
+	notify = notify_notification_new("Keyring", text, NULL);
+	g_free(text);
+
+	notify_notification_set_urgency(notify, NOTIFY_URGENCY_CRITICAL);
+	notify_notification_add_action(notify, ACTION_ALLOW, "Allow", user_confirmation_callback, &result, NULL);
+	notify_notification_add_action(notify, ACTION_DENY, "Deny", user_confirmation_callback, &result, NULL);
+
+	notify_notification_show(notify, &error);
+
+	g_assert(error == NULL);
+
+	confirmation_result_wait(&result);
+
+	return result.result;
+}
+
 static gboolean
 op_sign_request (GkdSshAgentCall *call)
 {
@@ -1051,6 +1224,12 @@ op_sign_request (GkdSshAgentCall *call)
 		hash = make_pkcs1_sign_hash (halgo, data, n_data, &n_hash);
 	else
 		hash = make_raw_sign_hash (halgo, data, n_data, &n_hash);
+
+	/* Ask for confirmation */
+	if (!request_user_confirmation(call, key)) {
+		egg_buffer_add_byte (call->resp, GKD_SSH_RES_FAILURE);
+		return TRUE;
+	}
 
 	session = gck_object_get_session (key);
 	g_return_val_if_fail (session, FALSE);

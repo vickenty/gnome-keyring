@@ -17,6 +17,8 @@ GCR_REQ=3.5.3
 GCRYPT_REQ=1.2.2
 GCRYPT_LIBVER=1
 
+LIBNOTIFY_REQ=0.7
+
 dnl ****************************************************************************
 
 GKR_MAJOR=3
@@ -626,6 +628,17 @@ else
 	AC_MSG_RESULT(no)
 	valgrind_status="no"
 fi
+
+# ----------------------------------------------------------------------
+# Libnotify
+
+GDK_PIXBUF_REQ=2.10
+
+PKG_CHECK_MODULES(GDK_PXIBUF, gdk-pixbuf-2.0 >= $GDK_PIXBUF_REQ)
+PKG_CHECK_MODULES(LIBNOTIFY, libnotify >= $LIBNOTIFY_REQ)
+
+DAEMON_CFLAGS="$DAEMON_CFLAGS $GDK_PIXBUF_CFLAGS $LIBNOTIFY_CFLAGS"
+DAEMON_LIBS="$DAEMON_LIBS $GDK_PIXBUF_LIBS $LIBNOTIFY_LIBS"
 
 # ----------------------------------------------------------------------
 
